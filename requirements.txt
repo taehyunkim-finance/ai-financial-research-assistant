@@ -1,0 +1,9 @@
+streamlit
+pandas
+numpy
+requests
+trafilatura
+beautifulsoup4
+lxml
+google-genai
+pydantic
