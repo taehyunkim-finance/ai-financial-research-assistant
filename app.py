@@ -24,6 +24,8 @@ st.set_page_config(
     layout="wide",
 )
 
+st.set_option("client.toolbarMode", "viewer")
+
 st.title("📊 AI Financial Research Assistant")
 st.caption(
     "DART 재무정보와 최신 뉴스를 기반으로 "
