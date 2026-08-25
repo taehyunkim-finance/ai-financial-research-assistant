@@ -1,8 +1,7 @@
-import io
 import re
-import zipfile
-import xml.etree.ElementTree as ET
 from datetime import datetime
+from pathlib import Path
+from typing import List
 
 import numpy as np
 import pandas as pd
@@ -14,7 +13,6 @@ from bs4 import BeautifulSoup
 from google import genai
 from google.genai import types
 from pydantic import BaseModel, Field
-from typing import List
 
 
 # ============================================================
@@ -52,7 +50,13 @@ NAVER_HEADERS = {
 GEMINI_MODEL = "gemini-3.5-flash"
 
 AI_CLIENT = genai.Client(
-    api_key=GEMINI_API_KEY
+    api_key=GEMINI_API_KEY,
+    http_options=types.HttpOptions(
+        timeout=60000,
+        retry_options=types.HttpRetryOptions(
+            attempts=1
+        ),
+    ),
 )
 
 REQUEST_TIMEOUT = 30
@@ -68,7 +72,7 @@ COMMON_HEADERS = {
 
 
 # ============================================================
-# AI OUTPUT SCHEMA
+# AI OUTPUT
 # ============================================================
 
 class NewsIssue(BaseModel):
@@ -116,18 +120,33 @@ def safe_float(value):
 
 def dart_get_json(endpoint, **params):
 
-    response = requests.get(
-        f"https://opendart.fss.or.kr/api/{endpoint}",
-        params={
-            "crtfc_key": DART_API_KEY,
-            **params,
-        },
-        timeout=REQUEST_TIMEOUT,
-    )
+    try:
+        response = requests.get(
+            f"https://opendart.fss.or.kr/api/{endpoint}",
+            params={
+                "crtfc_key": DART_API_KEY,
+                **params,
+            },
+            timeout=REQUEST_TIMEOUT,
+        )
 
-    response.raise_for_status()
+    except requests.RequestException:
+        raise RuntimeError(
+            "DART_NETWORK_ERROR"
+        ) from None
 
-    data = response.json()
+    if response.status_code != 200:
+        raise RuntimeError(
+            "DART_HTTP_ERROR"
+        )
+
+    try:
+        data = response.json()
+
+    except ValueError:
+        raise RuntimeError(
+            "DART_RESPONSE_ERROR"
+        ) from None
 
     if data.get("status") not in (
         None,
@@ -135,16 +154,16 @@ def dart_get_json(endpoint, **params):
         "013",
     ):
         raise RuntimeError(
-            f"DART 오류 {data.get('status')}: "
-            f"{data.get('message', '알 수 없는 오류')}"
+            "DART_API_ERROR"
         )
 
     return data
 
 
 # ============================================================
-# DART COMPANY LIST
-# 24시간 캐시
+# COMPANY LIST
+# GitHub corp_codes.csv 사용
+# DART 전체목록 다운로드 없음
 # ============================================================
 
 @st.cache_data(
@@ -153,61 +172,37 @@ def dart_get_json(endpoint, **params):
 )
 def load_corp_df():
 
-    response = requests.get(
-        "https://opendart.fss.or.kr/api/corpCode.xml",
-        params={
-            "crtfc_key": DART_API_KEY
-        },
-        timeout=180,
+    csv_path = (
+        Path(__file__).resolve().parent
+        / "corp_codes.csv"
     )
 
-    response.raise_for_status()
-
-    with zipfile.ZipFile(
-        io.BytesIO(response.content)
-    ) as zf:
-
-        xml_data = zf.read(
-            "CORPCODE.xml"
+    if not csv_path.exists():
+        raise FileNotFoundError(
+            "CORP_CODES_FILE_MISSING"
         )
 
-    root = ET.fromstring(
-        xml_data
+    df = pd.read_csv(
+        csv_path,
+        dtype=str,
+        keep_default_na=False,
+        encoding="utf-8-sig",
     )
 
-    rows = []
+    required_columns = {
+        "회사명",
+        "DART코드",
+        "종목코드",
+    }
 
-    for item in root.findall("list"):
+    if not required_columns.issubset(
+        df.columns
+    ):
+        raise ValueError(
+            "CORP_CODES_FORMAT_ERROR"
+        )
 
-        rows.append({
-            "회사명":
-                (
-                    item.findtext(
-                        "corp_name"
-                    )
-                    or ""
-                ).strip(),
-
-            "DART코드":
-                (
-                    item.findtext(
-                        "corp_code"
-                    )
-                    or ""
-                ).strip(),
-
-            "종목코드":
-                (
-                    item.findtext(
-                        "stock_code"
-                    )
-                    or ""
-                ).strip(),
-        })
-
-    return pd.DataFrame(
-        rows
-    )
+    return df
 
 
 def find_company(
@@ -218,6 +213,11 @@ def find_company(
     query = str(
         company_query
     ).strip()
+
+    if not query:
+        raise ValueError(
+            "EMPTY_COMPANY_NAME"
+        )
 
     exact = corp_df[
         corp_df["회사명"]
@@ -244,11 +244,8 @@ def find_company(
         ]
 
         if matches.empty:
-
             raise ValueError(
-                f"DART에서 "
-                f"'{company_query}'을 "
-                "찾지 못했습니다."
+                "COMPANY_NOT_FOUND"
             )
 
         row = matches.iloc[0]
@@ -610,24 +607,41 @@ def naver_news_search(
     display=30,
 ):
 
-    response = requests.get(
-        "https://naverapihub.apigw.ntruss.com/search/v1/news",
-        headers=NAVER_HEADERS,
-        params={
-            "query": company_name,
-            "display": display,
-            "start": 1,
-            "sort": "date",
-            "format": "json",
-        },
-        timeout=REQUEST_TIMEOUT,
-    )
+    try:
+        response = requests.get(
+            "https://naverapihub.apigw.ntruss.com/search/v1/news",
+            headers=NAVER_HEADERS,
+            params={
+                "query": company_name,
+                "display": display,
+                "start": 1,
+                "sort": "date",
+                "format": "json",
+            },
+            timeout=REQUEST_TIMEOUT,
+        )
 
-    response.raise_for_status()
+    except requests.RequestException:
+        raise RuntimeError(
+            "NAVER_NETWORK_ERROR"
+        ) from None
+
+    if response.status_code != 200:
+        raise RuntimeError(
+            "NAVER_HTTP_ERROR"
+        )
+
+    try:
+        payload = response.json()
+
+    except ValueError:
+        raise RuntimeError(
+            "NAVER_RESPONSE_ERROR"
+        ) from None
 
     news = []
 
-    for item in response.json().get(
+    for item in payload.get(
         "items",
         []
     ):
@@ -711,7 +725,8 @@ def extract_article_body(
                 allow_redirects=True,
             )
 
-            response.raise_for_status()
+            if response.status_code != 200:
+                continue
 
             body = trafilatura.extract(
                 response.text,
@@ -849,7 +864,7 @@ def article_candidates(
 
 # ============================================================
 # MAIN ANALYSIS
-# 결과 15분 캐시
+# 같은 회사 결과 15분 캐시
 # ============================================================
 
 @st.cache_data(
@@ -959,11 +974,7 @@ def analyze_company(
             "report":
                 None,
             "ai_error":
-                (
-                    "분석 가능한 "
-                    "기사본문을 "
-                    "찾지 못했습니다."
-                ),
+                "NO_ARTICLE_BODY",
         }
 
     article_parts = []
@@ -999,8 +1010,7 @@ def analyze_company(
 
         ratio_text = (
             "금융회사이므로 "
-            "일반기업 재무비율 "
-            "미적용"
+            "일반기업 재무비율 미적용"
         )
 
     else:
@@ -1034,73 +1044,32 @@ def analyze_company(
 
 {article_text}
 
-
 규칙:
 
 1. 제공된 자료만 사용합니다.
-
-2. 재무분석은 DART 숫자에만
-근거합니다.
-
-3. 외부 사실이나 숫자를
-임의로 만들지 않습니다.
-
-4. 비교기업 또는 업종평균이
-제공되지 않았다면
-높다, 낮다, 우수하다,
-양호하다 등의 절대평가를
-하지 않습니다.
-
-5. 영업현금흐름만으로
-채무상환능력을
-단정하지 않습니다.
-
-6. 뉴스분석은 제공된
-실제 기사본문에만 근거합니다.
-
-7. 분석 대상 회사가
-기사의 핵심 주체가 아닌
-일반 시장기사는 제외합니다.
-
-8. 같은 사건을 다룬 기사는
-하나의 이슈로 묶습니다.
-
-9. 최종 뉴스 이슈는
-중요도 3 이상만 포함합니다.
-
-10. 최종 뉴스 이슈는
-최대 5개입니다.
-
-11. article_index는
-제공된 기사 번호만 사용합니다.
-
-12. 다른 기업 정보는
-comparison_reference에만
-작성합니다.
-
-13. 기사에 없는 숫자를
-추정하거나 계산하지 않습니다.
-
-14. 매수·매도 추천을
-하지 않습니다.
-
-15. 판단 근거가 부족하면
-추가 확인 필요라고
-명시합니다.
-
-16. RM View는
-현금창출, 부채,
-상환재원, 자금수요,
-사업리스크 중심입니다.
-
-17. PB View는
-성장성, 수익성,
-이익의 질, 실적 모멘텀,
-주주가치 관련
-확인 포인트 중심입니다.
-
+2. 재무분석은 DART 숫자에만 근거합니다.
+3. 외부 사실이나 숫자를 임의로 만들지 않습니다.
+4. 비교기업 또는 업종평균이 제공되지 않았다면
+   높다, 낮다, 우수하다, 양호하다 등의
+   절대평가를 하지 않습니다.
+5. 영업현금흐름만으로 채무상환능력을 단정하지 않습니다.
+6. 뉴스분석은 제공된 실제 기사본문에만 근거합니다.
+7. 분석 대상 회사가 기사의 핵심 주체가 아닌
+   일반 시장기사는 제외합니다.
+8. 같은 사건을 다룬 기사는 하나의 이슈로 묶습니다.
+9. 최종 뉴스 이슈는 중요도 3 이상만 포함합니다.
+10. 최종 뉴스 이슈는 최대 5개입니다.
+11. article_index는 제공된 기사 번호만 사용합니다.
+12. 다른 기업 정보는 comparison_reference에만 작성합니다.
+13. 기사에 없는 숫자를 추정하거나 계산하지 않습니다.
+14. 매수·매도 추천을 하지 않습니다.
+15. 판단 근거가 부족하면 추가 확인 필요라고 명시합니다.
+16. RM View는 현금창출, 부채, 상환재원,
+    자금수요, 사업리스크 중심입니다.
+17. PB View는 성장성, 수익성, 이익의 질,
+    실적 모멘텀, 주주가치 관련 확인 포인트 중심입니다.
 18. 중요도 1 또는 2인 뉴스는
-news_issues에 절대 포함하지 않습니다.
+    news_issues에 절대 포함하지 않습니다.
 """
 
     try:
@@ -1124,7 +1093,7 @@ news_issues에 절대 포함하지 않습니다.
             response.parsed
         )
 
-    except Exception as e:
+    except Exception:
 
         return {
             "company": company,
@@ -1143,7 +1112,7 @@ news_issues에 절대 포함하지 않습니다.
             "report":
                 None,
             "ai_error":
-                str(e),
+                "GEMINI_ERROR",
         }
 
     report.news_issues = [
@@ -1175,12 +1144,75 @@ news_issues에 절대 포함하지 않습니다.
 
 
 # ============================================================
+# SAFE ERROR MESSAGES
+# API 키 / URL / 내부예외 절대 표시하지 않음
+# ============================================================
+
+def render_safe_error(
+    error_code
+):
+
+    messages = {
+
+        "EMPTY_COMPANY_NAME":
+            "회사명을 입력해주세요.",
+
+        "COMPANY_NOT_FOUND":
+            "DART 기업목록에서 "
+            "해당 회사를 찾지 못했습니다.",
+
+        "CORP_CODES_FILE_MISSING":
+            "기업목록 파일을 "
+            "불러오지 못했습니다.",
+
+        "CORP_CODES_FORMAT_ERROR":
+            "기업목록 파일 형식에 "
+            "문제가 있습니다.",
+
+        "DART_NETWORK_ERROR":
+            "DART 연결에 실패했습니다. "
+            "잠시 후 다시 시도해주세요.",
+
+        "DART_HTTP_ERROR":
+            "DART 서버 응답에 문제가 있습니다. "
+            "잠시 후 다시 시도해주세요.",
+
+        "DART_RESPONSE_ERROR":
+            "DART 응답을 "
+            "처리하지 못했습니다.",
+
+        "DART_API_ERROR":
+            "DART API 요청을 "
+            "처리하지 못했습니다.",
+
+        "NAVER_NETWORK_ERROR":
+            "NAVER 뉴스 연결에 "
+            "실패했습니다.",
+
+        "NAVER_HTTP_ERROR":
+            "NAVER 뉴스 서버 응답에 "
+            "문제가 있습니다.",
+
+        "NAVER_RESPONSE_ERROR":
+            "NAVER 뉴스 응답을 "
+            "처리하지 못했습니다.",
+    }
+
+    return messages.get(
+        error_code,
+        "분석 중 일시적인 오류가 발생했습니다. "
+        "잠시 후 다시 시도해주세요.",
+    )
+
+
+# ============================================================
 # UI
 # ============================================================
 
 company_query = st.text_input(
     "분석할 회사명을 입력하세요",
-    placeholder="예: 팬오션, 삼성전자, 대한항공",
+    placeholder=
+        "예: 팬오션, 삼성전자, 대한항공",
 )
 
 analyze_button = st.button(
@@ -1211,14 +1243,25 @@ if analyze_button:
                 company_query.strip()
             )
 
-    except Exception as e:
+    except (
+        ValueError,
+        RuntimeError,
+        FileNotFoundError,
+    ) as e:
 
         st.error(
-            "분석 중 오류가 발생했습니다."
+            render_safe_error(
+                str(e)
+            )
         )
 
-        st.code(
-            str(e)
+        st.stop()
+
+    except Exception:
+
+        st.error(
+            "분석 중 일시적인 오류가 발생했습니다. "
+            "잠시 후 다시 시도해주세요."
         )
 
         st.stop()
@@ -1259,8 +1302,8 @@ if analyze_button:
 
         st.warning(
             "현재 금융회사 전용 "
-            "BIS · NIM · 건전성 지표 "
-            "모듈은 개발 중입니다. "
+            "BIS · NIM · 건전성 지표 모듈은 "
+            "개발 중입니다. "
             "일반기업 비율은 적용하지 않습니다."
         )
 
@@ -1512,25 +1555,24 @@ if analyze_button:
                 "완료하지 못했습니다."
             )
 
-            st.caption(
-                "DART 재무정보와 "
-                "뉴스 수집 결과는 "
-                "정상적으로 확보되었습니다."
-            )
+            if (
+                result["ai_error"]
+                == "NO_ARTICLE_BODY"
+            ):
 
-            if result[
-                "ai_error"
-            ]:
+                st.caption(
+                    "분석 가능한 기사본문을 "
+                    "충분히 확보하지 못했습니다."
+                )
 
-                with st.expander(
-                    "오류 내용 보기"
-                ):
+            else:
 
-                    st.code(
-                        result[
-                            "ai_error"
-                        ]
-                    )
+                st.caption(
+                    "Gemini 응답이 일시적으로 "
+                    "실패했습니다. "
+                    "DART 재무정보와 뉴스 수집 결과에는 "
+                    "영향을 주지 않습니다."
+                )
 
 
 st.divider()
