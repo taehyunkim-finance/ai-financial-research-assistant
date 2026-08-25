@@ -1,3 +1,4 @@
+import json
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -15,6 +16,8 @@ from google.genai import types
 from pydantic import BaseModel, Field
 
 
+APP_VERSION = "2026-08-26-v3-jsonfix"
+
 st.set_page_config(
     page_title="AI Financial Research Assistant",
     page_icon="📊",
@@ -26,6 +29,7 @@ st.caption(
     "DART 재무정보와 최신 뉴스를 기반으로 "
     "기업금융 RM · PB 관점의 기업 리서치를 제공합니다."
 )
+st.caption(f"App version: {APP_VERSION}")
 
 DART_API_KEY = st.secrets["DART_API_KEY"]
 NAVER_CLIENT_ID = st.secrets["NAVER_CLIENT_ID"]
@@ -459,17 +463,65 @@ def extract_selected_articles(news_list, selected_issues):
 
 
 def gemini_structured(prompt, schema):
+    """Gemini JSON 호출을 SDK의 response.parsed에 의존하지 않고 직접 검증한다."""
+    schema_text = json.dumps(
+        schema.model_json_schema(),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+    final_prompt = f"""{prompt}
+
+출력 형식 규칙:
+- 설명문, 마크다운, 코드블록 없이 JSON 객체 하나만 출력합니다.
+- 아래 JSON Schema의 필드명과 자료형을 정확히 지킵니다.
+- 모든 필수 필드를 반드시 포함합니다.
+
+JSON Schema:
+{schema_text}
+"""
+
     try:
         response = AI_CLIENT.models.generate_content(
             model=GEMINI_MODEL,
-            contents=prompt,
+            contents=final_prompt,
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
-                response_schema=schema,
+                temperature=0.1,
+                max_output_tokens=8192,
             ),
         )
-        return response.parsed, None
-    except Exception:
+
+        text = (response.text or "").strip()
+        if not text:
+            return None, "EMPTY_RESPONSE"
+
+        # 혹시 코드펜스가 섞여도 안전하게 제거
+        text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"\s*```$", "", text)
+
+        # JSON 앞뒤에 잡문이 붙는 경우 객체 부분만 복구
+        start = text.find("{")
+        end = text.rfind("}")
+        if start >= 0 and end > start:
+            text = text[start:end + 1]
+
+        payload = json.loads(text)
+        parsed = schema.model_validate(payload)
+        return parsed, None
+
+    except Exception as e:
+        message = str(e).lower()
+
+        if "429" in message or "resource_exhausted" in message:
+            return None, "RATE_LIMIT"
+        if "503" in message or "unavailable" in message:
+            return None, "SERVICE_BUSY"
+        if "504" in message or "deadline" in message or "timeout" in message:
+            return None, "TIMEOUT"
+        if "json" in message or "validation" in message:
+            return None, "JSON_FORMAT_ERROR"
+
         return None, "GEMINI_ERROR"
 
 
@@ -914,17 +966,29 @@ if analyze_button:
         st.warning("회사명을 입력해주세요.")
         st.stop()
 
-    session_key = f"analysis::{query}"
+    # 앱 버전을 키에 포함해 이전 버전의 실패 캐시를 절대 재사용하지 않음
+    session_key = f"{APP_VERSION}::analysis::{query}"
 
     try:
         if session_key in st.session_state:
             result = st.session_state[session_key]
-            st.info("같은 세션의 기존 분석 결과를 다시 표시합니다.")
+            st.info("같은 세션의 정상 완료 분석 결과를 다시 표시합니다.")
         else:
             with st.spinner(
                 "재무 분석 → 뉴스 선별 → 핵심 뉴스 심층분석을 진행하고 있습니다..."
             ):
                 result = analyze_company(query)
+
+            # 세 단계가 모두 정상 완료된 경우에만 캐시
+            financial_ok = result.get("financial_report") is not None
+            selection_ok = result.get("selection_report") is not None
+            selected_count = len(result.get("selected_articles") or [])
+            deep_ok = (
+                selected_count == 0
+                or result.get("news_report") is not None
+            )
+
+            if financial_ok and selection_ok and deep_ok:
                 st.session_state[session_key] = result
 
         render_result(result)
