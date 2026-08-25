@@ -52,7 +52,7 @@ GEMINI_MODEL = "gemini-3.5-flash"
 AI_CLIENT = genai.Client(
     api_key=GEMINI_API_KEY,
     http_options=types.HttpOptions(
-        timeout=60000,
+        timeout=300000,
         retry_options=types.HttpRetryOptions(
             attempts=1
         ),
