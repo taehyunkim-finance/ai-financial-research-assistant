@@ -43,7 +43,15 @@ NAVER_HEADERS = {
     "X-NCP-APIGW-API-KEY": NAVER_CLIENT_SECRET,
 }
 
-GEMINI_MODEL = "gemini-3.5-flash"
+GEMINI_MODELS = [
+    "gemini-3.5-flash",
+    "gemini-3.6-flash",
+    "gemini-3.7-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-3.1-flash-lite",
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+]
 
 AI_CLIENT = genai.Client(
     api_key=GEMINI_API_KEY,
@@ -465,7 +473,8 @@ def extract_selected_articles(news_list, selected_issues):
 
 
 def gemini_structured(prompt, schema):
-    """Gemini JSON 호출을 SDK의 response.parsed에 의존하지 않고 직접 검증한다."""
+    """한 모델이 한도/서버 문제로 실패하면 다음 Gemini 모델로 자동 전환한다."""
+
     schema_text = json.dumps(
         schema.model_json_schema(),
         ensure_ascii=False,
@@ -483,48 +492,148 @@ JSON Schema:
 {schema_text}
 """
 
-    try:
-        response = AI_CLIENT.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=final_prompt,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                temperature=0.1,
-                max_output_tokens=8192,
-            ),
-        )
+    blocked_models = st.session_state.get(
+        "gemini_blocked_models",
+        []
+    )
 
-        text = (response.text or "").strip()
-        if not text:
-            return None, "EMPTY_RESPONSE"
+    last_error = "GEMINI_ERROR"
 
-        # 혹시 코드펜스가 섞여도 안전하게 제거
-        text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
-        text = re.sub(r"\s*```$", "", text)
+    for model_name in GEMINI_MODELS:
 
-        # JSON 앞뒤에 잡문이 붙는 경우 객체 부분만 복구
-        start = text.find("{")
-        end = text.rfind("}")
-        if start >= 0 and end > start:
-            text = text[start:end + 1]
+        if model_name in blocked_models:
+            continue
 
-        payload = json.loads(text)
-        parsed = schema.model_validate(payload)
-        return parsed, None
+        try:
+            response = AI_CLIENT.models.generate_content(
+                model=model_name,
+                contents=final_prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    max_output_tokens=8192,
+                ),
+            )
 
-    except Exception as e:
-        message = str(e).lower()
+        except Exception as e:
+            message = str(e).lower()
 
-        if "429" in message or "resource_exhausted" in message:
-            return None, "RATE_LIMIT"
-        if "503" in message or "unavailable" in message:
-            return None, "SERVICE_BUSY"
-        if "504" in message or "deadline" in message or "timeout" in message:
-            return None, "TIMEOUT"
-        if "json" in message or "validation" in message:
-            return None, "JSON_FORMAT_ERROR"
+            # 사용량 한도 초과
+            if (
+                "429" in message
+                or "resource_exhausted" in message
+                or "quota" in message
+            ):
+                last_error = "RATE_LIMIT"
 
-        return None, "GEMINI_ERROR"
+                if model_name not in blocked_models:
+                    blocked_models.append(model_name)
+
+                    st.session_state[
+                        "gemini_blocked_models"
+                    ] = blocked_models
+
+                continue
+
+            # 서버 혼잡
+            if (
+                "503" in message
+                or "unavailable" in message
+            ):
+                last_error = "SERVICE_BUSY"
+                continue
+
+            # 시간 초과
+            if (
+                "504" in message
+                or "deadline" in message
+                or "timeout" in message
+            ):
+                last_error = "TIMEOUT"
+                continue
+
+            # 프로젝트에서 해당 모델 사용 불가
+            if (
+                "404" in message
+                or "not found" in message
+                or "403" in message
+                or "permission_denied" in message
+            ):
+                last_error = "MODEL_UNAVAILABLE"
+
+                if model_name not in blocked_models:
+                    blocked_models.append(model_name)
+
+                    st.session_state[
+                        "gemini_blocked_models"
+                    ] = blocked_models
+
+                continue
+
+            last_error = "GEMINI_ERROR"
+            continue
+
+        try:
+            text = (
+                response.text
+                or ""
+            ).strip()
+
+            if not text:
+                last_error = "EMPTY_RESPONSE"
+                continue
+
+            # 혹시 ```json 코드블록이 섞여도 제거
+            text = re.sub(
+                r"^```(?:json)?\s*",
+                "",
+                text,
+                flags=re.IGNORECASE,
+            )
+
+            text = re.sub(
+                r"\s*```$",
+                "",
+                text,
+            )
+
+            # JSON 앞뒤 잡문 제거
+            start = text.find("{")
+            end = text.rfind("}")
+
+            if (
+                start >= 0
+                and end > start
+            ):
+                text = text[
+                    start:end + 1
+                ]
+
+            payload = json.loads(text)
+
+            parsed = schema.model_validate(
+                payload
+            )
+
+            # 어떤 모델이 성공했는지 내부 기록
+            st.session_state[
+                "last_gemini_model"
+            ] = model_name
+
+            return parsed, None
+
+        except (
+            json.JSONDecodeError,
+            ValueError,
+            TypeError,
+        ):
+            last_error = "JSON_FORMAT_ERROR"
+            continue
+
+        except Exception:
+            last_error = "GEMINI_ERROR"
+            continue
+
+    return None, last_error
 
 
 def run_financial_ai(company_name, analysis_mode, df_fin, ratio_df):
